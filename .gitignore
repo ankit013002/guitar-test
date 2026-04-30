@@ -8,3 +8,4 @@ node_modules/
 *_analysis.json
 *_corrected*
 *_correction_report.json
+*_spectrogram.png
