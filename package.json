@@ -1,0 +1,17 @@
+{
+  "name": "guitar-audio-correction",
+  "version": "1.0.0",
+  "description": "CLI tool for correcting pitch and buzz in guitar recordings",
+  "main": "cli.js",
+  "bin": {
+    "guitar-correct": "./cli.js"
+  },
+  "scripts": {
+    "check-deps": "node cli.js check-deps"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": ["guitar", "audio", "pitch-correction", "music-transcription"],
+  "license": "MIT"
+}
