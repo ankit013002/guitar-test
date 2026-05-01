@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pyo
+node_modules/
+*.wav
+*.mp3
+*.mid
+*_analysis.json
+*_corrected*
+*_correction_report.json
+*_spectrogram.png
