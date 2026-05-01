@@ -12,7 +12,10 @@ import librosa
 import soundfile as sf
 from scipy import signal
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=UserWarning,       module='librosa')
+warnings.filterwarnings('ignore', category=UserWarning,       module='numba')
+warnings.filterwarnings('ignore', category=FutureWarning,     module='librosa')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='librosa')
 
 try:
     from midiutil import MIDIFile
@@ -93,37 +96,118 @@ def _vibrato_smooth_ola(segment, f0_frames, sr, hop_length, target_hz):
 
 
 # ---------------------------------------------------------------------------
+# Chord segment analysis (chromagram-based, for polyphonic / strummed tracks)
+# ---------------------------------------------------------------------------
+
+_CHROMA_NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+def _analyze_chord_segments(y_trimmed, sr, hop_length, onset_frames, onset_times, buzz_ratio, flatness):
+    """Return a note-list using chromagram energy instead of pYIN.
+    off_pitch and has_vibrato are always False — pitch-shifting a polyphonic
+    signal is unsafe, so those fields carry no meaning here.
+    Buzz detection is still valid and applied unchanged.
+    """
+    chroma = librosa.feature.chroma_cqt(y=y_trimmed, sr=sr, hop_length=hop_length)
+    n_chroma_frames = chroma.shape[1]
+    notes = []
+    n_segs = len(onset_frames) - 1
+
+    for i in range(n_segs):
+        fs = int(onset_frames[i])
+        fe = int(onset_frames[i + 1])
+        if fs >= fe or (onset_times[i + 1] - onset_times[i]) < 0.030:
+            continue
+
+        seg_chroma = chroma[:, fs:min(fe, n_chroma_frames)]
+        if seg_chroma.shape[1] == 0:
+            continue
+        mean_chroma = seg_chroma.mean(axis=1)
+        total_energy = mean_chroma.sum()
+        if total_energy < 1e-6:
+            continue
+
+        root_pc    = int(np.argmax(mean_chroma))
+        confidence = float(mean_chroma[root_pc] / total_energy)
+
+        seg_buzz     = buzz_ratio[fs:min(fe, len(buzz_ratio))]
+        seg_flat     = flatness[fs:min(fe, len(flatness))]
+        buzz_score   = float(np.percentile(seg_buzz, 95)) if len(seg_buzz) else 0.0
+        flatness_p90 = float(np.percentile(seg_flat,  90)) if len(seg_flat)  else 0.0
+        has_buzz     = buzz_score > 0.25 and flatness_p90 > 0.008
+
+        notes.append({
+            "index":                 i,
+            "timestamp":             float(onset_times[i]),
+            "duration":              float(onset_times[i + 1] - onset_times[i]),
+            "original_freq_hz":      0.0,
+            "original_note":         _CHROMA_NOTES[root_pc],
+            "original_midi":         0,
+            "pitch_deviation_cents": 0.0,
+            "corrected_note":        _CHROMA_NOTES[root_pc],
+            "corrected_freq_hz":     0.0,
+            "confidence":            round(confidence, 3),
+            "buzz_score":            round(buzz_score, 4),
+            "has_buzz":              has_buzz,
+            "off_pitch":             False,
+            "has_vibrato":           False,
+            "vibrato_semitones":     0.0,
+            "was_corrected":         False,
+            "f0_frames":             [],
+            "frame_start":           fs,
+            "frame_end":             fe,
+            "sample_start":          int(librosa.frames_to_samples(fs, hop_length=hop_length)),
+            "sample_end":            int(librosa.frames_to_samples(fe, hop_length=hop_length)),
+        })
+
+    return notes
+
+
+# ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, frame_length=2048):
+def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, frame_length=2048, mode='auto'):
+    if not os.path.isfile(input_file):
+        _result({"success": False, "error": f"Input file not found: {input_file}"})
+        return
     _progress("Loading audio file…")
     y, sr    = librosa.load(input_file, sr=sr_target, mono=True)
     duration = librosa.get_duration(y=y, sr=sr)
     _progress(f"Loaded {duration:.2f}s at {sr} Hz")
 
+    # Silence trim – remove leading/trailing noise so onset detection is clean
+    _progress("Trimming silence…")
+    y_trimmed, trim_idx = librosa.effects.trim(y, top_db=30)
+    trim_offset = trim_idx[0] / sr  # seconds of leading silence removed
+    if len(y_trimmed) < sr * 0.1:   # guard: if everything got trimmed, use original
+        y_trimmed   = y
+        trim_offset = 0.0
+
     # Tempo detection
     _progress("Estimating tempo…")
     try:
-        tempo_val, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
-        tempo_bpm    = float(tempo_val) if 40.0 <= float(tempo_val) <= 300.0 else 120.0
+        tempo_arr, _ = librosa.beat.beat_track(y=y_trimmed, sr=sr, hop_length=hop_length)
+        # librosa may return a numpy scalar or a 1-element array depending on version
+        tempo_bpm_raw = float(np.atleast_1d(tempo_arr)[0])
+        tempo_bpm     = tempo_bpm_raw if 40.0 <= tempo_bpm_raw <= 300.0 else 120.0
     except Exception:
         tempo_bpm = 120.0
     _progress(f"Estimated tempo: {tempo_bpm:.1f} BPM")
 
-    # Onset detection
+    # Onset detection (on trimmed signal; timestamps adjusted back to original timeline)
     _progress("Detecting note onsets…")
     onset_frames = librosa.onset.onset_detect(
-        y=y, sr=sr, hop_length=hop_length, backtrack=True, units='frames'
+        y=y_trimmed, sr=sr, hop_length=hop_length, backtrack=True, units='frames',
+        wait=8,   # minimum ~186 ms between onsets (prevents duplicate detections on chords)
     )
-    onset_times  = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
-    onset_frames = np.append(onset_frames, len(y) // hop_length)
+    onset_times  = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length) + trim_offset
+    onset_frames = np.append(onset_frames, len(y_trimmed) // hop_length)
     onset_times  = np.append(onset_times,  duration)
 
-    # Pitch detection
+    # Pitch detection (on trimmed signal)
     _progress("Running pYIN pitch detection…")
     f0, voiced_flag, voiced_probs = librosa.pyin(
-        y,
+        y_trimmed,
         fmin=librosa.note_to_hz('E2'),
         fmax=librosa.note_to_hz('E6'),
         sr=sr,
@@ -133,7 +217,7 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
 
     # Spectral features for buzz detection
     _progress("Computing spectral features…")
-    D         = librosa.stft(y, n_fft=frame_length, hop_length=hop_length)
+    D         = librosa.stft(y_trimmed, n_fft=frame_length, hop_length=hop_length)
     magnitude = np.abs(D)
     freqs     = librosa.fft_frequencies(sr=sr, n_fft=frame_length)
 
@@ -141,14 +225,41 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
     normal_mask   = (freqs > 80) & (freqs <= 5000)
     high_energy   = magnitude[buzz_mask,   :].sum(axis=0)
     normal_energy = magnitude[normal_mask, :].sum(axis=0)
-    buzz_ratio    = high_energy / (normal_energy + 1e-8)
+    # Simple high-freq ratio – loud/quiet notes have the same ratio for a clean tone.
+    # High-pitched notes have harmonics >5 kHz, so this alone causes false positives;
+    # spectral flatness (below) is used as a gate to distinguish harmonic content from noise.
+    buzz_ratio = high_energy / (normal_energy + 1e-8)
+
+    # Spectral flatness: 0 = perfectly tonal, 1 = white noise.
+    # Clean guitar notes score ~0.001–0.01; buzz adds inharmonic noise → higher flatness.
+    flatness = librosa.feature.spectral_flatness(
+        y=y_trimmed, n_fft=frame_length, hop_length=hop_length
+    )[0]  # shape: (n_frames,)
+
+    # Auto-detect mono vs chord based on average pYIN confidence of voiced frames.
+    # pYIN assigns high probability to clean single notes (> 0.4) but low
+    # probability to polyphonic content because multiple simultaneous
+    # frequencies don't fit the single-pitch model — giving avg confidence
+    # well below 0.4 even when most frames are technically "voiced".
+    if mode == 'auto':
+        voiced_confs = voiced_probs[voiced_flag] if voiced_flag.any() else np.array([])
+        avg_voiced_conf = float(voiced_confs.mean()) if len(voiced_confs) > 0 else 0.0
+        mode = 'mono' if avg_voiced_conf >= 0.4 else 'chord'
+        _progress(f"Auto-detected mode: {mode} (avg pYIN confidence: {avg_voiced_conf:.2f})")
 
     # Per-note analysis
     _progress("Analysing individual notes…")
-    notes  = []
-    n_segs = len(onset_frames) - 1
 
-    for i in range(n_segs):
+    if mode == 'chord':
+        _progress("Running chromagram analysis (chord/polyphonic mode)…")
+        notes = _analyze_chord_segments(
+            y_trimmed, sr, hop_length, onset_frames, onset_times, buzz_ratio, flatness
+        )
+    else:
+        notes  = []
+        n_segs = len(onset_frames) - 1
+
+    for i in range(n_segs) if mode != 'chord' else []:
         fs = int(onset_frames[i])
         fe = int(onset_frames[i + 1])
         if fs >= fe:
@@ -157,7 +268,8 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
         seg_f0     = f0[fs:fe]
         seg_voiced = voiced_flag[fs:fe]
         seg_probs  = voiced_probs[fs:fe]
-        seg_buzz   = buzz_ratio[fs:fe]
+        seg_buzz   = buzz_ratio[fs:min(fe, len(buzz_ratio))]
+        seg_flat   = flatness[fs:min(fe, len(flatness))]
 
         voiced_f0 = seg_f0[seg_voiced & (seg_f0 > 0)]
         if len(voiced_f0) < 3:
@@ -169,13 +281,24 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
         note_name        = librosa.midi_to_note(midi_note)
         pitch_dev_cents  = float((midi_float - midi_note) * 100)
         confidence       = float(np.mean(seg_probs[seg_voiced]) if seg_voiced.any() else 0.0)
-        buzz_score       = float(np.percentile(seg_buzz, 95))
+        buzz_score       = float(np.percentile(seg_buzz, 95)) if len(seg_buzz) else 0.0
+        flatness_p90     = float(np.percentile(seg_flat,  90)) if len(seg_flat)  else 0.0
         voiced_midi_vals = librosa.hz_to_midi(voiced_f0)
         vibrato_st       = float(np.std(voiced_midi_vals)) if len(voiced_midi_vals) > 1 else 0.0
 
-        has_buzz    = buzz_score > 0.30
-        off_pitch   = abs(pitch_dev_cents) > 20
+        # Require BOTH elevated high-freq ratio AND elevated spectral flatness.
+        # This prevents high-pitched notes (whose clean harmonics reach >5 kHz) from
+        # being mis-flagged as buzzy based on frequency content alone.
+        has_buzz = buzz_score > 0.18 and flatness_p90 > 0.006
+        # 30-cent threshold: natural guitar intonation varies ±15-20¢ due to string
+        # tension and fretting pressure; flagging at 20¢ produces too many false positives.
+        # Also require minimum confidence — pYIN pitch estimates below 0.3 are unreliable.
+        off_pitch   = abs(pitch_dev_cents) > 30 and confidence >= 0.3
         has_vibrato = vibrato_st > 0.15
+
+        # Discard sub-30 ms entries – they are onset detection artifacts, not real notes
+        if (onset_times[i + 1] - onset_times[i]) < 0.030:
+            continue
 
         # Per-frame f0 stored for OLA vibrato correction (0 = unvoiced)
         f0_frames_note = [
@@ -208,10 +331,14 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
         })
 
     total         = len(notes)
-    flagged       = sum(1 for n in notes if n['has_buzz'] or n['off_pitch'] or n['confidence'] < 0.5)
     buzz_count    = sum(1 for n in notes if n['has_buzz'])
     off_pitch_cnt = sum(1 for n in notes if n['off_pitch'])
-    avg_conf      = float(np.mean([n['confidence'] for n in notes])) if notes else 0.0
+    vibrato_cnt   = sum(1 for n in notes if n['has_vibrato'])
+    # Flag only genuine detectable issues — not low confidence alone.
+    # Low confidence means the detector isn't sure what note was played;
+    # that's not a "problem" that correction can fix.
+    flagged   = sum(1 for n in notes if n['has_buzz'] or n['off_pitch'])
+    avg_conf  = float(np.mean([n['confidence'] for n in notes])) if notes else 0.0
 
     analysis = {
         "input_file":         input_file,
@@ -219,10 +346,12 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
         "sample_rate":        sr,
         "hop_length":         hop_length,
         "tempo_bpm":          round(tempo_bpm, 1),
+        "mode":               mode,
         "total_notes":        total,
         "flagged_notes":      flagged,
         "buzz_notes":         buzz_count,
         "off_pitch_notes":    off_pitch_cnt,
+        "vibrato_notes":      vibrato_cnt,
         "average_confidence": round(avg_conf, 3),
         "notes":              notes,
     }
@@ -235,10 +364,12 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
         "success": True,
         "output":  output_json,
         "summary": {
+            "mode":               mode,
             "total_notes":        total,
             "flagged_notes":      flagged,
             "buzz_notes":         buzz_count,
             "off_pitch_notes":    off_pitch_cnt,
+            "vibrato_notes":      vibrato_cnt,
             "average_confidence": round(avg_conf, 3),
             "duration":           round(duration, 2),
             "tempo_bpm":          round(tempo_bpm, 1),
@@ -253,14 +384,24 @@ def analyze_audio(input_file, output_json, sr_target=22050, hop_length=512, fram
 def correct_audio(input_file, fixes_json, output_wav,
                   output_midi=None, aggressiveness=0.8, smooth_vibrato=False):
 
+    aggressiveness = max(0.0, min(1.0, aggressiveness))
+
+    if not os.path.isfile(input_file):
+        _result({"success": False, "error": f"Input file not found: {input_file}"})
+        return
+    if not os.path.isfile(fixes_json):
+        _result({"success": False, "error": f"Fixes JSON not found: {fixes_json}"})
+        return
+
     _progress("Loading analysis…")
     with open(fixes_json) as fh:
         analysis = json.load(fh)
 
-    sr        = analysis['sample_rate']
+    sr         = analysis['sample_rate']
     hop_length = analysis['hop_length']
     tempo_bpm  = analysis.get('tempo_bpm', 120.0)
     notes      = analysis['notes']
+    track_mode = analysis.get('mode', 'mono')
 
     _progress(f"Tempo: {tempo_bpm:.1f} BPM")
     _progress("Loading audio…")
@@ -287,41 +428,41 @@ def correct_audio(input_file, fixes_json, output_wav,
             "corrected_note": note['original_note'],
             "actions":        [],
         }
+        preserve_attack_n = 0
 
-        # Respect TUI review decisions if present, else use auto-detection flags
-        do_pitch   = note.get('pitch_correct_approved', note['off_pitch'])
-        do_buzz    = note.get('buzz_remove_approved',   note['has_buzz'])
-        do_vibrato = smooth_vibrato and note.get('has_vibrato', False)
+        seg_duration = (se - ss) / sr
 
-        # --- Pitch correction -------------------------------------------
-        dev_cents = note['pitch_deviation_cents']
-        if do_pitch and abs(dev_cents) > 10:
-            shift_st = (-dev_cents * aggressiveness) / 100.0
-            if abs(shift_st) > 0.05:
-                try:
-                    seg = librosa.effects.pitch_shift(
-                        seg, sr=sr, n_steps=shift_st, bins_per_octave=24
-                    )
-                    note['corrected_note']    = librosa.midi_to_note(note['original_midi'])
-                    note['corrected_freq_hz'] = float(librosa.midi_to_hz(note['original_midi']))
-                    note['was_corrected']     = True
-                    modified                  = True
-                    c_info['corrected_note']  = note['corrected_note']
-                    c_info['actions'].append(f"pitch_shift {dev_cents:+.1f}¢")
-                except Exception as exc:
-                    c_info['actions'].append(f"pitch_shift_err: {exc}")
+        # Respect TUI review decisions if present, else use auto-detection flags.
+        # Chord mode: pitch-shifting polyphonic audio is unsafe, skip it entirely.
+        pitch_approved = 'pitch_correct_approved' in note  # TUI user explicitly approved
+        if track_mode == 'chord':
+            do_pitch = False
+        elif pitch_approved:
+            do_pitch = note['pitch_correct_approved']
+        else:
+            # Confidence gate: pYIN below 0.4 is too unreliable to trust for pitch shifting.
+            # Duration gate: segments < 40 ms pitch-shift poorly and create metallic artefacts.
+            do_pitch = (note['off_pitch']
+                        and note['confidence'] >= 0.4
+                        and seg_duration >= 0.04)
+        do_buzz    = note.get('buzz_remove_approved', note['has_buzz'])
+        do_vibrato = False if track_mode == 'chord' else (smooth_vibrato and note.get('has_vibrato', False))
 
-        # --- Octave correction ------------------------------------------
-        midi_val = note['original_midi']
-        if midi_val < GUITAR_MIDI_MIN or midi_val > GUITAR_MIDI_MAX:
-            corrected_midi = midi_val
+        # --- Octave correction (must happen before pitch correction) ------
+        midi_val       = note['original_midi']
+        corrected_midi = midi_val
+        # midi_val == 0 is the sentinel used by chord-mode segments (no single pitch).
+        # Skip octave correction entirely in that case to avoid nonsensical 4-octave shifts.
+        if midi_val > 0 and (midi_val < GUITAR_MIDI_MIN or midi_val > GUITAR_MIDI_MAX):
             while corrected_midi < GUITAR_MIDI_MIN:
                 corrected_midi += 12
             while corrected_midi > GUITAR_MIDI_MAX:
                 corrected_midi -= 12
             if corrected_midi != midi_val:
                 try:
-                    seg = librosa.effects.pitch_shift(seg, sr=sr, n_steps=corrected_midi - midi_val)
+                    seg = librosa.effects.pitch_shift(
+                        seg, sr=sr, n_steps=corrected_midi - midi_val, bins_per_octave=24
+                    )
                     note['corrected_note']    = librosa.midi_to_note(corrected_midi)
                     note['corrected_freq_hz'] = float(librosa.midi_to_hz(corrected_midi))
                     note['was_corrected']     = True
@@ -330,6 +471,35 @@ def correct_audio(input_file, fixes_json, output_wav,
                     c_info['actions'].append(f"octave_fix {note['original_note']}→{note['corrected_note']}")
                 except Exception as exc:
                     c_info['actions'].append(f"octave_fix_err: {exc}")
+
+        # --- Pitch correction (snaps to nearest semitone) ----------------
+        # Use corrected_midi (post octave fix) as the snap target.
+        # Scale effective aggressiveness by deviation magnitude so that notes
+        # only slightly off (30-50¢) are nudged gently rather than snapped hard —
+        # hard-snapping borderline notes sounds mechanical and over-processed.
+        dev_cents = note['pitch_deviation_cents']
+        if do_pitch and abs(dev_cents) > 10:
+            abs_dev = abs(dev_cents)
+            if abs_dev < 40:
+                eff_aggr = aggressiveness * 0.5   # gentle nudge for borderline notes
+            elif abs_dev < 60:
+                eff_aggr = aggressiveness * 0.75  # moderate
+            else:
+                eff_aggr = aggressiveness          # full correction for clearly off notes
+            shift_st = (-dev_cents * eff_aggr) / 100.0
+            if abs(shift_st) > 0.05:
+                try:
+                    seg = librosa.effects.pitch_shift(
+                        seg, sr=sr, n_steps=shift_st, bins_per_octave=24
+                    )
+                    note['corrected_note']    = librosa.midi_to_note(corrected_midi)
+                    note['corrected_freq_hz'] = float(librosa.midi_to_hz(corrected_midi))
+                    note['was_corrected']     = True
+                    modified                  = True
+                    c_info['corrected_note']  = note['corrected_note']
+                    c_info['actions'].append(f"pitch_shift {dev_cents:+.1f}¢ (eff_aggr={eff_aggr:.2f})")
+                except Exception as exc:
+                    c_info['actions'].append(f"pitch_shift_err: {exc}")
 
         # --- Vibrato smoothing (OLA) ------------------------------------
         if do_vibrato:
@@ -349,24 +519,69 @@ def correct_audio(input_file, fixes_json, output_wav,
         # --- Buzz removal -----------------------------------------------
         if do_buzz:
             buzz_score = note['buzz_score']
-            cutoff_hz  = max(3000, int(5000 - buzz_score * 1000 * aggressiveness))
-            norm_cut   = cutoff_hz / (sr / 2)
-            if norm_cut < 0.99 and len(seg) > 20:
+            # Protect the attack transient (22 ms) — the pluck snap lives here.
+            attack_n = min(int(sr * 0.022), len(seg) // 3)
+            preserve_attack_n = max(preserve_attack_n, attack_n)
+            seg_body = seg[attack_n:]
+
+            if len(seg_body) > 64:
                 try:
-                    b, a     = signal.butter(4, norm_cut, btype='low')
-                    filtered = signal.filtfilt(b, a, seg)
-                    blend    = min(0.9, buzz_score * aggressiveness * 1.5)
-                    seg      = (1.0 - blend) * seg + blend * filtered
+                    # Stage 1: Wiener filter — adaptive denoising that looks at
+                    # local signal statistics per-sample and attenuates the
+                    # inharmonic rattle of fret buzz while leaving the periodic
+                    # harmonic content largely intact.  Much more surgical than
+                    # a blanket low-pass filter.
+                    wiener_body = signal.wiener(
+                        seg_body.astype(np.float64), mysize=21
+                    ).astype(np.float32)
+                    # Guarantee meaningful denoising for any flagged note;
+                    # floor at 0.40 so mild buzz still gets treated.
+                    w_blend = min(0.72, 0.40 + buzz_score * aggressiveness * 0.5)
+                    seg_body = (1.0 - w_blend) * seg_body + w_blend * wiener_body
+
+                    # Stage 2: LPF for moderate-to-severe buzz that the Wiener
+                    # filter alone doesn't fully suppress (high-frequency rattle).
+                    lp_action = ""
+                    if buzz_score > 0.30:
+                        cutoff_hz = max(3000, int(5500 - buzz_score * 2500 * aggressiveness))
+                        norm_cut  = cutoff_hz / (sr / 2)
+                        if norm_cut < 0.99:
+                            b, a       = signal.butter(2, norm_cut, btype='low')
+                            lp_filt    = signal.filtfilt(b, a, seg_body)
+                            lp_blend   = min(0.50, (buzz_score - 0.30) * aggressiveness * 2.0)
+                            seg_body   = (1.0 - lp_blend) * seg_body + lp_blend * lp_filt
+                            lp_action  = f" + lpf@{cutoff_hz}Hz/{lp_blend:.2f}"
+
+                    seg = np.concatenate([seg[:attack_n], seg_body])
                     note['was_corrected'] = True
                     modified              = True
-                    c_info['actions'].append(f"buzz_removed cutoff={cutoff_hz}Hz blend={blend:.2f}")
+                    c_info['actions'].append(
+                        f"buzz_removed wiener={w_blend:.2f}{lp_action}"
+                    )
                 except Exception as exc:
                     c_info['actions'].append(f"buzz_removal_err: {exc}")
 
         if modified:
-            orig_peak = np.max(np.abs(y_out[ss:se])) + 1e-8
-            seg_peak  = np.max(np.abs(seg))            + 1e-8
-            seg       = seg * (orig_peak / seg_peak)
+            # Preserve original loudness using RMS ratio — more natural than peak ratio
+            # because peak can be dominated by a single transient spike.
+            if preserve_attack_n > 0 and preserve_attack_n < len(seg):
+                orig_rms = float(np.sqrt(np.mean(y_out[ss + preserve_attack_n:se] ** 2))) + 1e-8
+                seg_rms  = float(np.sqrt(np.mean(seg[preserve_attack_n:] ** 2)))          + 1e-8
+                seg[preserve_attack_n:] = seg[preserve_attack_n:] * (orig_rms / seg_rms)
+            else:
+                orig_rms = float(np.sqrt(np.mean(y_out[ss:se] ** 2))) + 1e-8
+                seg_rms  = float(np.sqrt(np.mean(seg ** 2)))           + 1e-8
+                seg      = seg * (orig_rms / seg_rms)
+            # Hard-clip to stay within headroom
+            seg      = np.clip(seg, -0.98, 0.98)
+            # 12 ms cosine crossfade at splice boundaries — longer than 5 ms to
+            # hide the artefacts that pitch-shifting introduces near segment edges.
+            fade_n = min(int(sr * 0.012), (se - ss) // 4)
+            if fade_n > 1:
+                fade     = (0.5 * (1.0 - np.cos(np.pi * np.arange(fade_n) / fade_n))).astype(np.float32)
+                orig_seg = y_out[ss:se]
+                seg[:fade_n]  = orig_seg[:fade_n]  * (1.0 - fade) + seg[:fade_n]  * fade
+                seg[-fade_n:] = seg[-fade_n:] * fade[::-1] + orig_seg[-fade_n:] * (1.0 - fade[::-1])
             y_out[ss:se] = seg[:se - ss]
             corrections.append(c_info)
 
@@ -378,7 +593,7 @@ def correct_audio(input_file, fixes_json, output_wav,
     _progress(f"Writing {output_wav}…")
     sf.write(output_wav, y_out, sr, subtype='PCM_16')
 
-    report_path = output_wav.replace('.wav', '_correction_report.json')
+    report_path = os.path.splitext(output_wav)[0] + '_correction_report.json'
     report = {
         "input_file":        input_file,
         "output_file":       output_wav,
@@ -448,6 +663,9 @@ def correct_audio(input_file, fixes_json, output_wav,
 
 def generate_spectrogram(input_file, output_png, analysis_json=None, compare_file=None, sr_target=22050):
     """Mel spectrogram PNG with analysis overlay; optional before/after comparison."""
+    if not os.path.isfile(input_file):
+        _result({"success": False, "error": f"Input file not found: {input_file}"})
+        return
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -477,9 +695,8 @@ def generate_spectrogram(input_file, output_png, analysis_json=None, compare_fil
         except Exception as exc:
             _progress(f"Could not load compare file: {exc}")
 
-    n_cols        = 2 if y2 is not None else 1
-    fig, axes_row = plt.subplots(1, n_cols, figsize=(8 * n_cols, 5), squeeze=False)
-    axes          = axes_row[0]
+    n_panels      = 2 if y2 is not None else 1
+    fig, axes_row = plt.subplots(n_panels, 1, figsize=(12, 4.5 * n_panels), squeeze=False)
     fig.patch.set_facecolor('#0d1117')
 
     hop   = 512
@@ -517,9 +734,13 @@ def generate_spectrogram(input_file, output_png, analysis_json=None, compare_fil
                         alpha=0.85, markeredgewidth=1.5, zorder=5)
 
     _progress("Rendering spectrogram…")
-    plot_spec(axes[0], y1, f'Original: {os.path.basename(input_file)}', overlay=True)
+    ax0 = axes_row[0][0]
+    plot_spec(ax0, y1, f'Original: {os.path.basename(input_file)}', overlay=True)
     if y2 is not None:
-        plot_spec(axes[1], y2, f'Corrected: {os.path.basename(compare_file)}', overlay=True)
+        ax1 = axes_row[1][0]
+        plot_spec(ax1, y2, f'Corrected: {os.path.basename(compare_file)}', overlay=True)
+        # Remove x-label from top panel when stacked to avoid redundancy
+        ax0.set_xlabel('')
 
     legend_els = [
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#58d68d', markersize=6, label='High conf'),
@@ -527,9 +748,9 @@ def generate_spectrogram(input_file, output_png, analysis_json=None, compare_fil
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#e74c3c', markersize=6, label='Low conf'),
         Line2D([0], [0], marker='x', color='#e74c3c', markersize=6, markeredgewidth=1.5, label='Buzz'),
     ]
-    axes[0].legend(handles=legend_els, loc='upper right',
-                   facecolor='#161b22', edgecolor='#30363d',
-                   labelcolor='#8b9ab0', fontsize=7)
+    ax0.legend(handles=legend_els, loc='upper right',
+               facecolor='#161b22', edgecolor='#30363d',
+               labelcolor='#8b9ab0', fontsize=7)
 
     plt.tight_layout(pad=1.5)
     _progress(f"Saving to {output_png}…")
@@ -537,6 +758,40 @@ def generate_spectrogram(input_file, output_png, analysis_json=None, compare_fil
     plt.close()
 
     _result({"success": True, "output": output_png})
+
+
+# ---------------------------------------------------------------------------
+# One-shot: analyze + correct in a single pass
+# ---------------------------------------------------------------------------
+
+def fix_audio(input_file, output_wav, output_midi=None, output_json=None,
+              aggressiveness=0.8, smooth_vibrato=False, sr_target=22050, hop_length=512,
+              mode='auto'):
+    """Analyze then immediately correct – no intermediate files required by caller."""
+    import tempfile, os as _os
+
+    # Write analysis to a temp file if the caller doesn't need to keep it
+    if output_json:
+        analysis_path = output_json
+        keep_json = True
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix='_analysis.json', delete=False)
+        tmp.close()
+        analysis_path = tmp.name
+        keep_json = False
+
+    try:
+        analyze_audio(input_file, analysis_path, sr_target=sr_target, hop_length=hop_length, mode=mode)
+        # analyze_audio already emitted its _result; now run correction
+        correct_audio(
+            input_file, analysis_path, output_wav,
+            output_midi    = output_midi,
+            aggressiveness = aggressiveness,
+            smooth_vibrato = smooth_vibrato,
+        )
+    finally:
+        if not keep_json and _os.path.exists(analysis_path):
+            _os.remove(analysis_path)
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +807,7 @@ def main():
     ap.add_argument('--output', default=None)
     ap.add_argument('--sr',     type=int, default=22050)
     ap.add_argument('--hop',    type=int, default=512)
+    ap.add_argument('--mode',   default='auto', choices=['auto', 'mono', 'chord'])
 
     cp = sub.add_parser('correct')
     cp.add_argument('input')
@@ -560,6 +816,17 @@ def main():
     cp.add_argument('--output-midi',     default=None)
     cp.add_argument('--aggressiveness',  type=float, default=0.8)
     cp.add_argument('--smooth-vibrato',  action='store_true')
+
+    fp = sub.add_parser('fix')
+    fp.add_argument('input')
+    fp.add_argument('--output',          default=None)
+    fp.add_argument('--output-midi',     default=None)
+    fp.add_argument('--output-analysis', default=None)
+    fp.add_argument('--aggressiveness',  type=float, default=0.8)
+    fp.add_argument('--smooth-vibrato',  action='store_true')
+    fp.add_argument('--sr',              type=int, default=22050)
+    fp.add_argument('--hop',             type=int, default=512)
+    fp.add_argument('--mode',            default='auto', choices=['auto', 'mono', 'chord'])
 
     sp = sub.add_parser('spectrogram')
     sp.add_argument('input')
@@ -572,7 +839,7 @@ def main():
 
     if args.command == 'analyze':
         out = args.output or args.input.rsplit('.', 1)[0] + '_analysis.json'
-        analyze_audio(args.input, out, sr_target=args.sr, hop_length=args.hop)
+        analyze_audio(args.input, out, sr_target=args.sr, hop_length=args.hop, mode=args.mode)
 
     elif args.command == 'correct':
         out = args.output or args.input.rsplit('.', 1)[0] + '_corrected.wav'
@@ -581,6 +848,19 @@ def main():
             output_midi    = getattr(args, 'output_midi', None),
             aggressiveness = args.aggressiveness,
             smooth_vibrato = args.smooth_vibrato,
+        )
+
+    elif args.command == 'fix':
+        out = args.output or args.input.rsplit('.', 1)[0] + '_corrected.wav'
+        fix_audio(
+            args.input, out,
+            output_midi    = getattr(args, 'output_midi', None),
+            output_json    = getattr(args, 'output_analysis', None),
+            aggressiveness = args.aggressiveness,
+            smooth_vibrato = args.smooth_vibrato,
+            sr_target      = args.sr,
+            hop_length     = args.hop,
+            mode           = args.mode,
         )
 
     elif args.command == 'spectrogram':
@@ -598,4 +878,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        _result({"success": False, "error": str(exc)})
+        sys.exit(1)
